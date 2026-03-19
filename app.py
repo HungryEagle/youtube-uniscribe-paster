@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import yt_dlp
 import time
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 # ── Config ──────────────────────────────────────────────────────────────────
 API_BASE = "https://api.uniscribe.co"
@@ -130,7 +131,18 @@ def extract_video_urls(playlist_url: str) -> list[dict]:
         return [{"url": playlist_url, "title": info.get("title", playlist_url)}]
 
 
-def send_to_uniscribe(video_url: str, title: str) -> tuple[bool, str]:
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+def _post_to_uniscribe(payload: dict, headers: dict) -> requests.Response:
+    """Low-level POST with retries for transient failures like timeouts."""
+    return requests.post(
+        f"{API_BASE}/api/v1/transcriptions/youtube",
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
+
+
+def send_to_uniscribe(video_url: str, title: str, status_placeholder=None) -> tuple[bool, str]:
     """POST one video to Uniscribe YouTube endpoint. Returns (success, message)."""
     payload = {
         "url": video_url,
@@ -138,8 +150,38 @@ def send_to_uniscribe(video_url: str, title: str) -> tuple[bool, str]:
         "transcription_type": "transcript",
     }
     headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+
+    def _update_retry_ui(retry_state):
+        # Called by tenacity before sleeping between retries.
+        if status_placeholder is not None:
+            next_attempt = min(retry_state.attempt_number + 1, 3)
+            status_placeholder.markdown(
+                f'<div class="status-row">'
+                f'<span>⏳</span>'
+                f'<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{title}</span>'
+                f'<span style="color:#888">Retrying… (attempt {next_attempt}/3)</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    post_with_retry = retry(
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(1),
+        before_sleep=_update_retry_ui,
+    )(_post_to_uniscribe)
+
     try:
-        r = requests.post(f"{API_BASE}/api/v1/transcriptions/youtube", json=payload, headers=headers, timeout=30)
+        if status_placeholder is not None:
+            status_placeholder.markdown(
+                f'<div class="status-row">'
+                f'<span>⏳</span>'
+                f'<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{title}</span>'
+                f'<span style="color:#888">Sending to Uniscribe…</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        r = post_with_retry(payload, headers)
         data = r.json()
         if data.get("success"):
             return True, "Queued ✓"
@@ -147,7 +189,7 @@ def send_to_uniscribe(video_url: str, title: str) -> tuple[bool, str]:
             err = data.get("error", {}).get("message", "Unknown error")
             return False, f"Error: {err}"
     except Exception as e:
-        return False, f"Request failed: {e}"
+        return False, f"Request failed after retries: {e}"
 
 
 # ── Submit logic ─────────────────────────────────────────────────────────────
@@ -167,10 +209,11 @@ if submit and url.strip():
     err_count = 0
 
     for i, vid in enumerate(videos, 1):
-        success, msg = send_to_uniscribe(vid["url"], vid["title"])
+        row_placeholder = st.empty()
+        success, msg = send_to_uniscribe(vid["url"], vid["title"], status_placeholder=row_placeholder)
         css_cls = "status-ok" if success else "status-err"
         icon    = "✓" if success else "✗"
-        st.markdown(
+        row_placeholder.markdown(
             f'<div class="status-row {css_cls}">'
             f'<span>{icon}</span>'
             f'<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{vid["title"]}</span>'
